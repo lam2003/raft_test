@@ -1,8 +1,3 @@
-// Server container for a Raft Consensus Module. Exposes Raft to the network
-// and enables RPCs between Raft peers.
-//
-// Eli Bendersky [https://eli.thegreenplace.net]
-// This code is in the public domain.
 package service
 
 import (
@@ -13,135 +8,132 @@ import (
 	"sync"
 )
 
-// Server wraps a raft.ConsensusModule along with a rpc.Server that exposes its
-// methods as RPC endpoints. It also manages the peers of the Raft server. The
-// main goal of this type is to simplify the code of raft.Server for
-// presentation purposes. raft.ConsensusModule has a *Server to do its peer
-// communication and doesn't have to worry about the specifics of running an
-// RPC server.
 type Server struct {
-	mu sync.Mutex
-
-	serverId int
-	peerIds  []int
-
-	// cm       *ConsensusModule
-	// storage  Storage
-	// rpcProxy *RPCProxy
-
-	rpcServer *rpc.Server
-	listener  net.Listener
-
-	// commitChan  chan<- CommitEntry
+	serverId    int
+	peerIds     []int
 	peerClients map[int]*rpc.Client
-
-	ready <-chan interface{}
-	quit  chan interface{}
-	wg    sync.WaitGroup
+	acceptConns []net.Conn
+	rpcServer   *rpc.Server
+	closeChan   chan struct{}
+	wg          sync.WaitGroup
+	listener    net.Listener
+	mu          sync.Mutex
 }
 
-// func NewServer(serverId int, peerIds []int, storage Storage, ready <-chan interface{}, commitChan chan<- CommitEntry) *Server {
-// 	s := new(Server)
-// 	s.serverId = serverId
-// 	s.peerIds = peerIds
-// 	s.peerClients = make(map[int]*rpc.Client)
-// 	s.storage = storage
-// 	s.ready = ready
-// 	s.commitChan = commitChan
-// 	s.quit = make(chan interface{})
-// 	return s
-// }
+func NewServer(serverId int, peerIds []int) *Server {
+	s := new(Server)
+	s.serverId = serverId
+	s.peerIds = peerIds
+	s.peerClients = make(map[int]*rpc.Client)
+	s.acceptConns = []net.Conn{}
+	s.closeChan = make(chan struct{}, 1)
+	return s
+}
 
-func (s *Server) Serve() {
-	s.mu.Lock()
-	// s.cm = NewConsensusModule(s.serverId, s.peerIds, s, s.storage, s.ready, s.commitChan)
-
-	// Create a new RPC server and register a RPCProxy that forwards all methods
-	// to n.cm
-	s.rpcServer = rpc.NewServer()
-	// s.rpcProxy = &RPCProxy{cm: s.cm}
-	// s.rpcServer.RegisterName("ConsensusModule", s.rpcProxy)
-
+func (s *Server) Init() error {
 	var err error
-	s.listener, err = net.Listen("tcp", ":0")
+	s.listener, err = net.Listen("tcp", "localhost:"+fmt.Sprintf("%d", s.serverId))
 	if err != nil {
-		log.Fatal(err)
+		log.Printf("[%d] listen failed. %s\n", s.serverId, err.Error())
+		return err
 	}
-	log.Printf("[%v] listening at %s", s.serverId, s.listener.Addr())
-	s.mu.Unlock()
 
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-
+		s.rpcServer = rpc.NewServer()
+		s.rpcServer.Register(NewRaftCore())
 		for {
 			conn, err := s.listener.Accept()
 			if err != nil {
 				select {
-				case <-s.quit:
+				case <-s.closeChan:
 					return
 				default:
-					log.Fatal("accept error:", err)
+					log.Printf("[%d] accept failed. %s\n", s.serverId, err.Error())
+					continue
 				}
 			}
+
 			s.wg.Add(1)
 			go func() {
+				defer s.wg.Done()
+				addAcceptConns := func() {
+					s.mu.Lock()
+					defer s.mu.Unlock()
+					s.acceptConns = append(s.acceptConns, conn)
+				}
+
+				addAcceptConns()
 				s.rpcServer.ServeConn(conn)
-				s.wg.Done()
 			}()
 		}
 	}()
+
+	return nil
 }
 
-// DisconnectAll closes all the client connections to peers for this server.
-func (s *Server) DisconnectAll() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for id := range s.peerClients {
-		if s.peerClients[id] != nil {
-			s.peerClients[id].Close()
-			s.peerClients[id] = nil
-		}
-	}
-}
-
-// Shutdown closes the server and waits for it to shut down properly.
-func (s *Server) Shutdown() {
-	// s.cm.Stop()
-	close(s.quit)
-	s.listener.Close()
-	s.wg.Wait()
-}
-
-func (s *Server) GetListenAddr() net.Addr {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.listener.Addr()
-}
-
-func (s *Server) ConnectToPeer(peerId int, addr net.Addr) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.peerClients[peerId] == nil {
-		client, err := rpc.Dial(addr.Network(), addr.String())
+func (s *Server) ConnectToPeers() {
+	connectPeer := func(peerId int) error {
+		client, err := rpc.Dial("tcp", "localhost:"+fmt.Sprintf("%d", peerId))
 		if err != nil {
+			log.Printf("[%d] connect to localhost:%d failed. %s\n", s.serverId, peerId, err.Error())
 			return err
 		}
+
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		_, ok := s.peerClients[peerId]
+		if ok {
+			client.Close()
+			log.Printf("[%d] peer[%d] already existed\n", s.serverId, peerId)
+			return nil
+		}
 		s.peerClients[peerId] = client
+		return nil
 	}
-	return nil
+
+	for _, peerId := range s.peerIds {
+		for {
+			select {
+			case <-s.closeChan:
+				return
+			default:
+				err := connectPeer(peerId)
+				if err != nil {
+					continue
+				}
+				log.Printf("[%d] connect to localhost:%d succeed\n", s.serverId, peerId)
+			}
+			break
+		}
+	}
 }
 
-// DisconnectPeer disconnects this server from the peer identified by peerId.
-func (s *Server) DisconnectPeer(peerId int) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.peerClients[peerId] != nil {
-		err := s.peerClients[peerId].Close()
-		s.peerClients[peerId] = nil
-		return err
+func (s *Server) Close() {
+	cleanAcceptConns := func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		for _, conn := range s.acceptConns {
+			conn.Close()
+		}
+		s.acceptConns = []net.Conn{}
 	}
-	return nil
+
+	cleanPeerClients := func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		for _, cli := range s.peerClients {
+			cli.Close()
+		}
+	}
+
+	close(s.closeChan)
+	s.listener.Close()
+	cleanAcceptConns()
+	cleanPeerClients()
+	s.wg.Wait()
+
 }
 
 func (s *Server) Call(id int, serviceMethod string, args interface{}, reply interface{}) error {
@@ -199,3 +191,26 @@ func (s *Server) Call(id int, serviceMethod string, args interface{}, reply inte
 // 	}
 // 	return rpp.cm.AppendEntries(args, reply)
 // }
+
+type RaftCore struct {
+}
+
+type Request struct {
+}
+
+type Response struct {
+}
+
+func NewRaftCore() *RaftCore {
+	return &RaftCore{}
+}
+
+func (c *RaftCore) AppendEntries(req Request, resp *Response) error {
+	resp = &Response{}
+	return nil
+}
+
+func (c *RaftCore) RequestVote(req Request, resp *Response) error {
+	resp = &Response{}
+	return nil
+}
