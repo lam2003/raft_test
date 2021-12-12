@@ -30,7 +30,7 @@ func NewServer(serverId int, peerIds []int) *Server {
 	return s
 }
 
-func (s *Server) Init() error {
+func (s *Server) Init(obj interface{}) error {
 	var err error
 	s.listener, err = net.Listen("tcp", "localhost:"+fmt.Sprintf("%d", s.serverId))
 	if err != nil {
@@ -42,7 +42,7 @@ func (s *Server) Init() error {
 	go func() {
 		defer s.wg.Done()
 		s.rpcServer = rpc.NewServer()
-		s.rpcServer.Register(NewRaftCore())
+		s.rpcServer.Register(obj)
 		for {
 			conn, err := s.listener.Accept()
 			if err != nil {
@@ -137,80 +137,10 @@ func (s *Server) Close() {
 }
 
 func (s *Server) Call(id int, serviceMethod string, args interface{}, reply interface{}) error {
-	s.mu.Lock()
 	peer := s.peerClients[id]
-	s.mu.Unlock()
-
-	// If this is called after shutdown (where client.Close is called), it will
-	// return an error.
 	if peer == nil {
 		return fmt.Errorf("call client %d after it's closed", id)
 	} else {
 		return peer.Call(serviceMethod, args, reply)
 	}
-}
-
-// RPCProxy is a trivial pass-thru proxy type for ConsensusModule's RPC methods.
-// It's useful for:
-// - Simulating a small delay in RPC transmission.
-// - Avoiding running into https://github.com/golang/go/issues/19957
-// - Simulating possible unreliable connections by delaying some messages
-//   significantly and dropping others when RAFT_UNRELIABLE_RPC is set.
-// type RPCProxy struct {
-// 	cm *ConsensusModule
-// }
-
-// func (rpp *RPCProxy) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error {
-// 	if len(os.Getenv("RAFT_UNRELIABLE_RPC")) > 0 {
-// 		dice := rand.Intn(10)
-// 		if dice == 9 {
-// 			rpp.cm.dlog("drop RequestVote")
-// 			return fmt.Errorf("RPC failed")
-// 		} else if dice == 8 {
-// 			rpp.cm.dlog("delay RequestVote")
-// 			time.Sleep(75 * time.Millisecond)
-// 		}
-// 	} else {
-// 		time.Sleep(time.Duration(1+rand.Intn(5)) * time.Millisecond)
-// 	}
-// 	return rpp.cm.RequestVote(args, reply)
-// }
-
-// func (rpp *RPCProxy) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) error {
-// 	if len(os.Getenv("RAFT_UNRELIABLE_RPC")) > 0 {
-// 		dice := rand.Intn(10)
-// 		if dice == 9 {
-// 			rpp.cm.dlog("drop AppendEntries")
-// 			return fmt.Errorf("RPC failed")
-// 		} else if dice == 8 {
-// 			rpp.cm.dlog("delay AppendEntries")
-// 			time.Sleep(75 * time.Millisecond)
-// 		}
-// 	} else {
-// 		time.Sleep(time.Duration(1+rand.Intn(5)) * time.Millisecond)
-// 	}
-// 	return rpp.cm.AppendEntries(args, reply)
-// }
-
-type RaftCore struct {
-}
-
-type Request struct {
-}
-
-type Response struct {
-}
-
-func NewRaftCore() *RaftCore {
-	return &RaftCore{}
-}
-
-func (c *RaftCore) AppendEntries(req Request, resp *Response) error {
-	resp = &Response{}
-	return nil
-}
-
-func (c *RaftCore) RequestVote(req Request, resp *Response) error {
-	resp = &Response{}
-	return nil
 }
