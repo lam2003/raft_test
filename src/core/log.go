@@ -1,6 +1,6 @@
 package core
 
 type Log struct {
-	term  int
-	index int
+	Term  int
+	Index int
 }
