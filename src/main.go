@@ -3,49 +3,48 @@ package main
 import (
 	"RaftTest/core"
 	"RaftTest/service"
+	"flag"
 	"fmt"
-	"os"
-	"os/signal"
+	"log"
+	"math/rand"
+	"time"
 )
+
+var id int
+var clusterNum int
 
 func main() {
 
-	server1 := service.NewServer(10000, []int{10001, 10002})
-	server2 := service.NewServer(10001, []int{10000, 10002})
-	server3 := service.NewServer(10002, []int{10000, 10001})
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	flag.IntVar(&id, "id", 0, "id")
+	flag.IntVar(&clusterNum, "cluster_num", 0, "cluster_num")
+	flag.Parse()
 
-	servers := []*service.Server{
-		server1,
-		server2,
-		server3,
-	}
-
-	raftArr := []*core.Raft{}
-	for idx, server := range servers {
-		raft := core.NewRaft(idx, 3, server)
-		err := server.Init(raft)
-		if err != nil {
-			return
+	rand.Seed(time.Now().Unix())
+	serverId := 10000 + id
+	peerIds := []int{}
+	for i := 0; i < clusterNum; i++ {
+		if i == id {
+			continue
 		}
-		raftArr = append(raftArr, raft)
+		peerIds = append(peerIds, i+10000)
 	}
 
-	for _, server := range servers {
-		server.ConnectToPeers()
+	server := service.NewServer(serverId, peerIds)
+	raft := core.NewRaft(id, clusterNum, server)
+
+	err := server.Init(raft)
+	if err != nil {
+		log.Println(err)
 	}
 
-	for _, raft := range raftArr {
-		go raft.Process()
+	server.ConnectToPeers()
+	go raft.Process()
+
+	idx := 0
+	for {
+		time.Sleep(time.Second)
+		raft.Put(fmt.Sprintf("hello_%d", idx))
+		idx++
 	}
-
-	ch := make(chan os.Signal, 1)
-	signal.Notify(ch, os.Interrupt, os.Kill)
-
-	sig := <-ch
-	fmt.Printf("killed by %v", sig)
-
-	for _, server := range servers {
-		server.Close()
-	}
-
 }

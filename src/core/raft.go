@@ -32,11 +32,11 @@ type Raft struct {
 }
 
 func electionTimeout() time.Duration {
-	return time.Duration(150+rand.Intn(150)) * time.Millisecond
+	return time.Duration(500+rand.Intn(500)) * time.Millisecond
 }
 
 func heartbeatTimeout() time.Duration {
-	return time.Duration(50) * time.Millisecond
+	return time.Duration(100) * time.Millisecond
 }
 
 func NewRaft(serverId int, clusterNum int, server *service.Server) *Raft {
@@ -153,8 +153,6 @@ func (r *Raft) startElection() {
 			resp := &VoteResponse{}
 			err := r.server.Call(id+10000, "Raft.VoteRPC", req, &resp)
 			if err != nil {
-				log.Printf("[%d] call peer[%d]::VoteRPC failed. %s\n",
-					r.serverId, id, err.Error())
 				return
 			}
 
@@ -162,6 +160,7 @@ func (r *Raft) startElection() {
 				if r.role != Candidate {
 					return false
 				}
+
 				if resp.Term > req.Term {
 					r.becomeFollower(resp.Term, id)
 					return true
@@ -169,17 +168,35 @@ func (r *Raft) startElection() {
 
 				if resp.Granted {
 					atomic.AddInt32(&votesReceived, 1)
-					if int(atomic.LoadInt32(&votesReceived)) > ((r.clusterNum + 1) / 2) {
+					if int(atomic.LoadInt32(&votesReceived)) >= ((r.clusterNum + 1) / 2) {
 						r.becomeLeader()
 						return true
 					}
 				}
 				return false
 			}
-			r.taskChan <- task
+			go func() { r.taskChan <- task }()
 		}
 		go rpc()
 	}
+}
+
+func (r *Raft) Put(str string) {
+	data := str
+	task := func() bool {
+		if r.role != Leader {
+			return false
+		}
+		n := len(r.logs)
+		log := &Log{
+			Index: n,
+			Term:  r.currentTerm,
+			Data:  data,
+		}
+		r.logs = append(r.logs, log)
+		return false
+	}
+	r.taskChan <- task
 }
 
 func (r *Raft) sendAppendEntries() {
@@ -190,14 +207,20 @@ func (r *Raft) sendAppendEntries() {
 		}
 
 		id := i
-		prevLogIndex := r.nextIndexs[id] - 1
+		nextIndex := r.nextIndexs[id]
+		prevLogIndex := nextIndex - 1
 		prevLogTerm := -1
 		if prevLogIndex >= 0 {
 			prevLogTerm = r.logs[prevLogIndex].Term
 		}
 
-		var entries []*Log
-		copy(r.logs[prevLogIndex+1:], entries)
+		n := len(r.logs)
+		entries := make([]*Log, n-(prevLogIndex+1))
+		idx := 0
+		for j := prevLogIndex + 1; j < n; j++ {
+			entries[idx] = r.logs[j]
+			idx++
+		}
 
 		rpc := func() {
 			req := &AppendEntriesRequest{}
@@ -211,16 +234,37 @@ func (r *Raft) sendAppendEntries() {
 			resp := &AppendEntriesResponse{}
 			err := r.server.Call(id+10000, "Raft.AppendEntriesRPC", req, resp)
 			if err != nil {
-				log.Printf("[%d] call peer[%d]::AppendEntriesRPC failed. %s\n",
-					r.serverId, id, err.Error())
 				return
 			}
 
 			task := func() bool {
-				fmt.Println(resp)
-				return false
+				if resp.Term > r.currentTerm {
+					r.becomeFollower(resp.Term, id)
+					return true
+				}
+
+				if r.role != Leader || resp.Term != r.currentTerm {
+					return false
+				}
+				if !resp.Success {
+					if resp.ConfilctTerm >= 0 {
+						lastLogIndex, _ := r.lastLogIndexAndTerm()
+						for i := lastLogIndex; i >= 0; i-- {
+							if resp.ConfilctTerm == r.logs[i].Term {
+								resp.ConfilctIndex = i + 1
+								break
+							}
+						}
+					}
+					r.nextIndexs[id] = resp.ConfilctIndex
+					return false
+				} else {
+					r.nextIndexs[id] = nextIndex + len(entries)
+					r.matchIndexs[id] = r.nextIndexs[id] - 1
+					return false
+				}
 			}
-			r.taskChan <- task
+			go func() { r.taskChan <- task }()
 		}
 		go rpc()
 	}
@@ -294,6 +338,11 @@ func (r *Raft) AppendEntriesRPC(req AppendEntriesRequest, resp *AppendEntriesRes
 
 		lastLogIndex, _ := r.lastLogIndexAndTerm()
 		if req.Term == r.currentTerm {
+			if r.role != Follower {
+				r.becomeFollower(req.Term, req.LeaderId)
+				return true
+			}
+
 			if req.PrevLogIndex == -1 || (req.PrevLogIndex <= lastLogIndex && req.PrevLogTerm == r.logs[req.PrevLogIndex].Term) {
 				newEntriesIndex := 0
 				for i := req.PrevLogIndex + 1; i <= lastLogIndex; i++ {
@@ -305,15 +354,21 @@ func (r *Raft) AppendEntriesRPC(req AppendEntriesRequest, resp *AppendEntriesRes
 				resp.Success = true
 				resp.Term = r.currentTerm
 				r.logs = append(r.logs[:req.PrevLogIndex+1+newEntriesIndex], req.Entries[newEntriesIndex:]...)
+
+				str := fmt.Sprintf("[%d]", r.serverId)
+				for _, log := range r.logs {
+					str += log.Data + " "
+				}
+				log.Println(str)
 			} else {
 				confilctTerm := -1
 				confilctIndex := -1
 
 				if req.PrevLogIndex > lastLogIndex {
-					confilctIndex = lastLogIndex
+					confilctIndex = lastLogIndex + 1
 				} else {
 					confilctTerm = r.logs[req.PrevLogIndex].Term
-					for i := lastLogIndex; i >= 0; i-- {
+					for i := req.PrevLogIndex - 1; i >= 0; i-- {
 						if r.logs[i].Term != confilctTerm {
 							confilctIndex = i + 1
 							break
@@ -323,9 +378,10 @@ func (r *Raft) AppendEntriesRPC(req AppendEntriesRequest, resp *AppendEntriesRes
 				resp.ConfilctIndex = confilctIndex
 				resp.ConfilctTerm = confilctTerm
 			}
+
+			r.resetElectionTimer()
 		}
 
-		r.resetElectionTimer()
 		return false
 	}
 
@@ -346,11 +402,10 @@ func (r *Raft) VoteRPC(req VoteRequest, resp *VoteResponse) error {
 		resp.Granted = false
 		resp.Term = r.currentTerm
 
+		needQuit := false
 		if req.Term > r.currentTerm {
-			r.becomeFollower(req.Term, req.CandidateId)
-			resp.Granted = true
-			resp.Term = r.currentTerm
-			return true
+			r.becomeFollower(req.Term, -1)
+			needQuit = true
 		}
 		lastLogIndex, lastLogTerm := r.lastLogIndexAndTerm()
 
@@ -358,12 +413,14 @@ func (r *Raft) VoteRPC(req VoteRequest, resp *VoteResponse) error {
 			(r.votedFor == -1 || r.votedFor == req.CandidateId) &&
 			((req.LastLogTerm > lastLogTerm) ||
 				(req.LastLogTerm == lastLogTerm && req.LastLogIndex >= lastLogIndex)) {
-			r.becomeFollower(req.Term, req.CandidateId)
+			r.votedFor = req.CandidateId
 			resp.Granted = true
-			resp.Term = r.currentTerm
-			return true
+			needQuit = true
+		} else {
+			resp.Granted = false
 		}
-		return false
+		resp.Term = r.currentTerm
+		return needQuit
 	}
 
 	r.taskChan <- task

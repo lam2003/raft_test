@@ -141,6 +141,25 @@ func (s *Server) Call(id int, serviceMethod string, args interface{}, reply inte
 	if peer == nil {
 		return fmt.Errorf("call client %d after it's closed", id)
 	} else {
-		return peer.Call(serviceMethod, args, reply)
+		err := peer.Call(serviceMethod, args, reply)
+		if err != nil {
+			peer.Close()
+
+			client, err := rpc.Dial("tcp", "localhost:"+fmt.Sprintf("%d", id))
+			if err != nil {
+				// log.Printf("[%d] connect to localhost:%d failed. %s\n", s.serverId, id, err.Error())
+				return err
+			}
+
+			f := func() {
+				s.mu.Lock()
+				defer s.mu.Unlock()
+				s.peerClients[id] = client
+			}
+			f()
+			err = client.Call(serviceMethod, args, reply)
+
+		}
+		return err
 	}
 }
