@@ -4,6 +4,7 @@ import (
 	"RaftTest/service"
 	"fmt"
 	"log"
+	"math"
 	"math/rand"
 	"sync/atomic"
 	"time"
@@ -117,7 +118,7 @@ func (r *Raft) becomeLeader() {
 	r.votedFor = -1
 	for idx := range r.nextIndexs {
 		r.nextIndexs[idx] = len(r.logs)
-		r.matchIndexs[idx] = 0
+		r.matchIndexs[idx] = -1
 	}
 	r.resetHeartbeatTimer()
 	log.Printf("[%d] become leader, term[%d]\n", r.serverId, r.currentTerm)
@@ -261,6 +262,28 @@ func (r *Raft) sendAppendEntries() {
 				} else {
 					r.nextIndexs[id] = nextIndex + len(entries)
 					r.matchIndexs[id] = r.nextIndexs[id] - 1
+
+					n := len(r.logs)
+					for k := r.commitIndex + 1; k < n; k++ {
+
+						if r.currentTerm != r.logs[k].Term {
+							continue
+						}
+
+						matchNum := 1
+						for l := 0; l < r.clusterNum; l++ {
+
+							if r.matchIndexs[l] >= r.logs[k].Index {
+								matchNum++
+							}
+						}
+
+						if matchNum >= (r.clusterNum+1)/2 {
+							r.commitIndex = k
+							log.Println(r.commitIndex)
+						}
+					}
+
 					return false
 				}
 			}
@@ -360,6 +383,8 @@ func (r *Raft) AppendEntriesRPC(req AppendEntriesRequest, resp *AppendEntriesRes
 					str += log.Data + " "
 				}
 				log.Println(str)
+
+				r.commitIndex = int(math.Min(float64(req.LeaderCommitIndex), float64(len(r.logs)-1)))
 			} else {
 				confilctTerm := -1
 				confilctIndex := -1
